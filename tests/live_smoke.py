@@ -2,16 +2,86 @@
 
 Runs against an already-started uvicorn (default http://127.0.0.1:8000).
 Covers: late-point rewrite/renumbering, gap truncation, idempotency and
-conflict rejection, and concurrent uploads/queries with snapshot consistency.
+conflict rejection, concurrent uploads/queries with snapshot consistency,
+and single-cell restore from an uploaded backup database.
 """
 
 import concurrent.futures
+import os
+import sqlite3
 import sys
+import tempfile
 import time
 
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+
+BACKUP_SCHEMA = """
+CREATE TABLE cells (
+    cell_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
+    updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
+);
+CREATE TABLE samples (
+    cell_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    current_ma INTEGER NOT NULL,
+    PRIMARY KEY (cell_id, ts)
+);
+CREATE TABLE report_versions (
+    cell_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    total_cycles INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
+    PRIMARY KEY (cell_id, version)
+);
+CREATE TABLE cycles (
+    cell_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    cycle_no INTEGER NOT NULL,
+    charge_ah REAL NOT NULL,
+    discharge_ah REAL NOT NULL,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL,
+    PRIMARY KEY (cell_id, version, cycle_no)
+);
+CREATE TABLE upload_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cell_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
+);
+"""
+
+
+def build_backup(cell, samples, total_cycles, cycles):
+    """Write a self-contained backup file: samples + one latest report."""
+    fd, path = tempfile.mkstemp(suffix=".db", prefix="battery-backup-")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    conn.executescript(BACKUP_SCHEMA)
+    conn.execute("INSERT INTO cells(cell_id) VALUES(?)", (cell,))
+    conn.executemany(
+        "INSERT INTO samples(cell_id, ts, current_ma) VALUES(?,?,?)",
+        [(cell, ts, round(cur * 1_000_000)) for ts, cur in samples],
+    )
+    conn.execute(
+        "INSERT INTO report_versions(cell_id, version, total_cycles) VALUES(?,?,?)",
+        (cell, 4, total_cycles),
+    )
+    conn.executemany(
+        "INSERT INTO cycles(cell_id, version, cycle_no, charge_ah, discharge_ah,"
+        " started_at, ended_at) VALUES(?,?,?,?,?,?,?)",
+        [
+            (cell, 4, no, ch, dis, start, end)
+            for no, ch, dis, start, end in cycles
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return path
 
 
 def upload(client, cell, rows, header="timestamp,current"):
@@ -20,6 +90,14 @@ def upload(client, cell, rows, header="timestamp,current"):
         f"{BASE}/cells/{cell}/samples",
         files={"file": ("batch.csv", text, "text/csv")},
     )
+
+
+def restore(client, cell, path):
+    with open(path, "rb") as fh:
+        return client.post(
+            f"{BASE}/cells/{cell}/restore",
+            files={"file": ("backup.db", fh.read(), "application/octet-stream")},
+        )
 
 
 def check(cond, msg):
@@ -114,6 +192,51 @@ def main():
 
         cells = c.get(f"{BASE}/cells").json()
         check(any(x["cell_id"] == cell for x in cells), "cell list endpoint")
+
+        # --- 5. restore one cell from a backup database ------------------
+        cell = "LIVE-RESTORE"
+        samples = [(0, 0), (10, 2), (20, 0), (30, -3), (40, 0),
+                   (50, 1), (60, 0), (70, -1.5), (80, 0)]
+        cycles = [
+            (1, 2 * 10 / 3600, 3 * 10 / 3600, 0, 40),
+            (2, 1 * 10 / 3600, 1.5 * 10 / 3600, 40, 80),
+        ]
+        backup = build_backup(cell, samples, 2, cycles)
+        try:
+            r = restore(c, cell, backup)
+            check(r.status_code == 201, f"backup restored (got {r.status_code})")
+            check(r.json()["version"] == 4, "original report version preserved")
+            rep = c.get(f"{BASE}/cells/{cell}/report").json()
+            check(rep["version"] == 4 and rep["total_cycles"] == 2,
+                  "restored report is queryable with the backup's version")
+            check([x["cycle_no"] for x in rep["cycles"]] == [1, 2],
+                  "restored cycle details complete and ordered")
+            check(abs(rep["cycles"][1]["discharge_ah"] - 1.5 * 10 / 3600) < 1e-12,
+                  "restored capacity equals recomputed capacity")
+
+            r = upload(c, cell, [(90, 1), (100, 0), (110, -1), (120, 0)])
+            check(r.status_code == 200 and r.json()["version"] == 5,
+                  "later upload continues from the restored version")
+            rep = c.get(f"{BASE}/cells/{cell}/report").json()
+            check(rep["total_cycles"] == 3, "continued upload recomputes on top")
+
+            r = restore(c, cell, backup)
+            check(r.status_code == 409, "second restore of the same cell -> 409")
+            check(c.get(f"{BASE}/cells/{cell}/report").json()["version"] == 5,
+                  "rejected restore leaves cell unchanged")
+
+            bad = os.path.join(tempfile.gettempdir(), "not-a-backup.db")
+            with open(bad, "wb") as fh:
+                fh.write(b"definitely not sqlite" * 40)
+            try:
+                r = restore(c, "LIVE-RESTORE-CORRUPT", bad)
+                check(r.status_code == 422, "corrupt backup -> 422")
+                check(c.get(f"{BASE}/cells/LIVE-RESTORE-CORRUPT/report").status_code == 404,
+                      "corrupt backup leaves no cell behind")
+            finally:
+                os.remove(bad)
+        finally:
+            os.remove(backup)
 
     print("\nALL LIVE CHECKS PASSED")
 

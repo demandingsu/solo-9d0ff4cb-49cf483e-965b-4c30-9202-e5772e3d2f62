@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .algorithm import Cycle, detect_cycles
+from .backup_restore import BackupCell
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cells (
@@ -66,6 +67,17 @@ class ConflictError(Exception):
 
 class ImportError_(Exception):
     """Generic import failure (bad CSV payload etc.)."""
+
+
+class RestoreConflictError(Exception):
+    """Cell already exists in the live database; restore is refused."""
+
+    def __init__(self, cell_id: str, where: str):
+        self.cell_id = cell_id
+        self.where = where
+        super().__init__(
+            f"cell {cell_id!r} already exists in the live database ({where})"
+        )
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -227,6 +239,131 @@ class Database:
             "duplicate": duplicate,
             "version": version,
             "total_cycles": len(cycles),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Restore from a validated backup
+    # ------------------------------------------------------------------ #
+    def restore_cell(self, backup: BackupCell) -> dict:
+        """Atomically restore one cell's samples + latest report + version.
+
+        *backup* must already have passed :func:`backup_restore.read_backup_cell`
+        (integrity, completeness and recomputation checks).  The restore is
+        rejected if the live database has any trace of the same cell — this is
+        checked inside the write transaction so two concurrent restores (or a
+        restore racing a first upload) cannot both succeed.
+
+        Either every row (samples, version row, cycle details, cell row) is
+        committed, or the transaction rolls back to its prior state.
+        """
+        if not backup.samples:
+            raise ImportError_(f"backup for {backup.cell_id!r} contains no samples")
+
+        conn = _connect(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            existing = conn.execute(
+                "SELECT 1 FROM cells WHERE cell_id=?",
+                (backup.cell_id,),
+            ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT 1 FROM samples WHERE cell_id=? LIMIT 1",
+                    (backup.cell_id,),
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT 1 FROM report_versions WHERE cell_id=? LIMIT 1",
+                    (backup.cell_id,),
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT 1 FROM cycles WHERE cell_id=? LIMIT 1",
+                    (backup.cell_id,),
+                ).fetchone()
+            if existing is not None:
+                raise RestoreConflictError(
+                    backup.cell_id, "same cell_id already present"
+                )
+
+            conn.executemany(
+                "INSERT INTO samples(cell_id, ts, current_ma) VALUES(?,?,?)",
+                [(backup.cell_id, ts, current_ma) for ts, current_ma in backup.samples],
+            )
+            conn.execute(
+                "INSERT INTO cells(cell_id) VALUES(?)",
+                (backup.cell_id,),
+            )
+            # Preserve the original report version number: only the latest
+            # version is restored, and later uploads continue from it.
+            conn.execute(
+                "INSERT INTO report_versions(cell_id, version, total_cycles,"
+                " created_at) VALUES(?,?,?, COALESCE(?,"
+                " strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+                (
+                    backup.cell_id,
+                    backup.version,
+                    backup.total_cycles,
+                    backup.report_created_at,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO cycles(cell_id, version, cycle_no, charge_ah,"
+                " discharge_ah, started_at, ended_at) VALUES(?,?,?,?,?,?,?)",
+                [
+                    (
+                        backup.cell_id,
+                        backup.version,
+                        c.cycle_no,
+                        c.charge_ah,
+                        c.discharge_ah,
+                        c.started_at,
+                        c.ended_at,
+                    )
+                    for c in backup.cycles
+                ],
+            )
+            conn.execute(
+                "INSERT INTO upload_log(cell_id, status, detail) VALUES(?,?,?)",
+                (
+                    backup.cell_id,
+                    "restored",
+                    f"version={backup.version} samples={len(backup.samples)}"
+                    f" cycles={backup.total_cycles}",
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                # e.g. the transaction was never started or already resolved
+                pass
+            try:
+                with self._conn() as log_conn:
+                    log_conn.execute(
+                        "INSERT INTO upload_log(cell_id, status, detail)"
+                        " VALUES(?,?,?)",
+                        (
+                            backup.cell_id,
+                            "restore-rejected",
+                            "restore rejected; no data changed",
+                        ),
+                    )
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+        return {
+            "cell_id": backup.cell_id,
+            "inserted": len(backup.samples),
+            "version": backup.version,
+            "total_cycles": backup.total_cycles,
+            "cycles_restored": len(backup.cycles),
+            "skipped_older_versions": backup.older_versions_skipped,
         }
 
     # ------------------------------------------------------------------ #
